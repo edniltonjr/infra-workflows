@@ -1,0 +1,216 @@
+# Workflow reutilizável: testes -> build da imagem -> push no GHCR -> deploy por SSH.
+#
+# Chamada (no repositório do app):
+#   jobs:
+#     deploy:
+#       uses: edniltonjr/infra-workflows/.github/workflows/deploy.yml@v1
+#       with: { app-name: "${{ vars.APP_NAME }}", deploy-path: "${{ vars.DEPLOY_PATH }}" }
+#       secrets: inherit
+#
+# O chamador precisa conceder `packages: write` e `contents: read`.
+name: deploy (reutilizável)
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: Nome do app (slug). Usado no .env e como pasta padrão.
+        type: string
+        required: true
+      domain:
+        description: Domínio público, usado só para o resumo do job.
+        type: string
+        default: ""
+      deploy-path:
+        description: Pasta do app na VPS. Padrão /opt/apps/<app-name>.
+        type: string
+        default: ""
+      ssh-port:
+        type: string
+        default: "22"
+      run-tests:
+        type: boolean
+        default: true
+      node-version:
+        type: string
+        default: "24"
+      install-command:
+        type: string
+        default: npm ci
+      test-command:
+        type: string
+        default: npm test
+      compose-file:
+        type: string
+        default: docker-compose.yml
+      docker-context:
+        type: string
+        default: .
+    secrets:
+      DEPLOY_HOST:
+        required: true
+      DEPLOY_USER:
+        required: true
+      DEPLOY_SSH_KEY:
+        required: true
+      DEPLOY_KNOWN_HOSTS:
+        required: true
+      DATABASE_URL:
+        required: false
+      REDIS_URL:
+        required: false
+      APP_ENV:
+        description: Linhas extras de .env (KEY=valor), opcional.
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    if: inputs.run-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+      - run: ${{ inputs.install-command }}
+      - run: ${{ inputs.test-command }}
+
+  build:
+    needs: test
+    # roda mesmo com os testes desligados (job "test" pulado), mas nunca se eles falharem
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - id: image
+        run: |
+          echo "repo=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.docker-context }}
+          push: true
+          tags: |
+            ${{ steps.image.outputs.image }}
+            ${{ steps.image.outputs.repo }}:latest
+          # Liga o pacote ao repositório: assim o GITHUB_TOKEN do repo consegue fazer pull dele.
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: ${{ inputs.compose-file }}
+          sparse-checkout-cone-mode: false
+
+      - name: Preparar SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - name: Deploy
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER_: ${{ secrets.DEPLOY_USER }}
+          PORT: ${{ inputs.ssh-port }}
+          APP_NAME: ${{ inputs.app-name }}
+          APP_DOMAIN: ${{ inputs.domain }}
+          DEPLOY_PATH: ${{ inputs.deploy-path }}
+          COMPOSE_FILE: ${{ inputs.compose-file }}
+          IMAGE: ${{ needs.build.outputs.image }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          APP_ENV: ${{ secrets.APP_ENV }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          DIR="${DEPLOY_PATH:-/opt/apps/$APP_NAME}"
+          # Valores entram em comandos remotos: só aceita caracteres seguros.
+          [[ "$APP_NAME" =~ ^[a-z0-9-]+$ ]] || { echo "app-name inválido"; exit 1; }
+          [[ "$DIR" =~ ^/[A-Za-z0-9/_.-]+$ ]] || { echo "deploy-path inválido"; exit 1; }
+          [[ "$GHCR_USER" =~ ^[A-Za-z0-9-]+(\[bot\])?$ ]] || { echo "actor inesperado"; exit 1; }
+
+          SSH=(ssh -i ~/.ssh/deploy_key -p "${PORT:-22}" -o BatchMode=yes -o StrictHostKeyChecking=yes "$USER_@$HOST")
+
+          "${SSH[@]}" "mkdir -p '$DIR'"
+          "${SSH[@]}" "cat > '$DIR/docker-compose.yml'" < "$COMPOSE_FILE"
+
+          # .env enviado por stdin: nunca aparece em argumentos de processo nem no log.
+          {
+            echo "IMAGE=$IMAGE"
+            echo "APP_NAME=$APP_NAME"
+            [ -n "$APP_DOMAIN" ] && echo "APP_DOMAIN=$APP_DOMAIN"
+            [ -n "$DATABASE_URL" ] && echo "DATABASE_URL=$DATABASE_URL"
+            [ -n "$REDIS_URL" ] && echo "REDIS_URL=$REDIS_URL"
+            [ -n "$APP_ENV" ] && printf '%s\n' "$APP_ENV"
+            true
+          } | "${SSH[@]}" "umask 077 && cat > '$DIR/.env'"
+
+          # Login no GHCR num DOCKER_CONFIG temporário: deploys simultâneos não interferem
+          # entre si e nenhuma credencial fica na VPS depois do job.
+          printf '%s' "$GHCR_TOKEN" | "${SSH[@]}" "
+            set -e
+            export DOCKER_CONFIG=\$(mktemp -d)
+            trap 'rm -rf \"\$DOCKER_CONFIG\"' EXIT
+            docker login ghcr.io -u '$GHCR_USER' --password-stdin >/dev/null
+            cd '$DIR'
+            docker compose pull
+            docker compose up -d --remove-orphans --wait --wait-timeout 180
+          "
+
+      - name: Logs do container em caso de falha
+        if: failure()
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER_: ${{ secrets.DEPLOY_USER }}
+          PORT: ${{ inputs.ssh-port }}
+          DIR: ${{ inputs.deploy-path || format('/opt/apps/{0}', inputs.app-name) }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "${PORT:-22}" -o BatchMode=yes "$USER_@$HOST" \
+            "cd '$DIR' 2>/dev/null && docker compose ps && docker compose logs --tail 100" || true
+
+      - name: Resumo
+        if: success()
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+          APP_DOMAIN: ${{ inputs.domain }}
+        run: |
+          {
+            echo "### Deploy concluído"
+            echo "- Imagem: \`$IMAGE\`"
+            [ -n "$APP_DOMAIN" ] && echo "- URL: https://$APP_DOMAIN"
+            true
+          } >> "$GITHUB_STEP_SUMMARY"
